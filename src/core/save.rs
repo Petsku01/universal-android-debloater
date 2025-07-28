@@ -5,7 +5,7 @@ use crate::gui::widgets::package_row::PackageRow;
 use crate::CACHE_DIR;
 use serde::{Deserialize, Serialize};
 use static_init::dynamic;
-use std::fs;
+use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 #[dynamic]
@@ -25,78 +25,73 @@ struct UserBackup {
 
 // Backup all `Uninstalled` and `Disabled` packages
 pub async fn backup_phone(
-    users: Vec<User>,
-    device_id: String,
-    phone_packages: Vec<Vec<PackageRow>>,
+    users: &[User],
+    device_id: &str,
+    phone_packages: &[Vec<PackageRow>],
 ) -> Result<(), String> {
-    let mut backup = PhoneBackup {
-        device_id: device_id.clone(),
-        ..PhoneBackup::default()
-    };
-
-    for u in users {
-        let mut user_backup = UserBackup {
-            id: u.id,
-            ..UserBackup::default()
-        };
-
-        for p in phone_packages[u.index].clone() {
-            user_backup.packages.push(CorePackage {
-                name: p.name.clone(),
-                state: p.state,
-            });
-        }
-        backup.users.push(user_backup);
-    }
-
-    match serde_json::to_string_pretty(&backup) {
-        Ok(json) => {
-            let backup_path = &*BACKUP_DIR.join(device_id);
-
-            if let Err(e) = fs::create_dir_all(backup_path) {
-                error!("BACKUP: could not create backup dir: {}", e);
-                return Err(e.to_string());
+    let backup = users.iter().enumerate().fold(
+        PhoneBackup {
+            device_id: device_id.to_string(),
+            ..Default::default()
+        },
+        |mut acc, (index, user)| {
+            let user_backup = UserBackup {
+                id: user.id,
+                packages: phone_packages[index]
+                    .iter()
+                    .map(|p| CorePackage {
+                        name: p.name.clone(),
+                        state: p.state,
+                    })
+                    .collect(),
+                ..Default::default()
             };
+            acc.users.push(user_backup);
+            acc
+        },
+    );
 
-            let backup_filename =
-                format!("{}.json", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
-
-            match fs::write(backup_path.join(backup_filename), json) {
-                Ok(_) => Ok(()),
-                Err(err) => Err(err.to_string()),
-            }
-        }
-        Err(err) => Err(err.to_string()),
+    let backup_path = BACKUP_DIR.join(device_id);
+    if let Err(e) = fs::create_dir_all(&backup_path) {
+        error!("BACKUP: could not create backup dir: {}", e);
+        return Err(e.to_string());
     }
+
+    let backup_filename = format!("{}.json", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    let json = serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())?;
+    fs::write(backup_path.join(backup_filename), json).map_err(|e| e.to_string())?;
+    
+    Ok(())
 }
 
 pub fn list_available_backups(dir: &Path) -> Vec<DisplayablePath> {
-    #[allow(clippy::option_if_let_else)]
-    match fs::read_dir(dir) {
-        Ok(files) => files
-            .filter_map(|e| e.ok())
-            .map(|e| DisplayablePath { path: e.path() })
-            .collect::<Vec<_>>(),
-        Err(_) => vec![],
-    }
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry: DirEntry| DisplayablePath { path: entry.path() })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-pub fn list_available_backup_user(backup: DisplayablePath) -> Vec<User> {
-    match fs::read_to_string(backup.path) {
-        Ok(data) => {
-            let phone_backup: PhoneBackup =
-                serde_json::from_str(&data).expect("Unable to parse backup file");
-
-            let mut users = vec![];
-            for u in phone_backup.users {
-                users.push(User {
+pub fn list_available_backup_users(backup: &DisplayablePath) -> Vec<User> {
+    match fs::read_to_string(&backup.path) {
+        Ok(data) => match serde_json::from_str::<PhoneBackup>(&data) {
+            Ok(phone_backup) => phone_backup
+                .users
+                .into_iter()
+                .map(|u| User {
                     id: u.id,
                     index: 0,
                     protected: false,
-                });
+                })
+                .collect(),
+            Err(e) => {
+                error!("[BACKUP]: Failed to parse backup file: {}", e);
+                vec![]
             }
-            users
-        }
+        },
         Err(e) => {
             error!("[BACKUP]: Selected backup file not found: {}", e);
             vec![]
@@ -115,65 +110,61 @@ pub fn restore_backup(
     packages: &[Vec<PackageRow>],
     settings: &DeviceSettings,
 ) -> Result<Vec<BackupPackage>, String> {
-    match fs::read_to_string(
-        settings
-            .backup
-            .selected
-            .as_ref()
-            .ok_or("field should be Some type")?
-            .path
-            .clone(),
-    ) {
-        Ok(data) => {
-            let phone_backup: PhoneBackup =
-                serde_json::from_str(&data).expect("Unable to parse backup file");
+    let backup_path = settings
+        .backup
+        .selected
+        .as_ref()
+        .ok_or("No backup selected")?
+        .path
+        .clone();
 
-            let mut commands = vec![];
-            for u in phone_backup.users {
-                let index = match selected_device.user_list.iter().find(|x| x.id == u.id) {
-                    Some(i) => i.index,
-                    None => return Err(format!("user {} doesn't exist", u.id)),
-                };
+    let data = fs::read_to_string(&backup_path).map_err(|e| e.to_string())?;
+    let phone_backup: PhoneBackup = serde_json::from_str(&data).map_err(|e| e.to_string())?;
 
-                for (i, backup_package) in u.packages.iter().enumerate() {
-                    let package: CorePackage;
-                    match packages[index]
-                        .iter()
-                        .find(|x| x.name == backup_package.name)
-                    {
-                        Some(p) => package = p.into(),
-                        None => {
-                            return Err(format!(
-                                "{} not found for user {}",
-                                backup_package.name, u.id
-                            ))
-                        }
-                    }
-                    let p_commands = apply_pkg_state_commands(
-                        &package,
-                        backup_package.state,
-                        &settings
-                            .backup
-                            .selected_user
-                            .ok_or("field should be Some type")?,
-                        selected_device,
-                    );
-                    if !p_commands.is_empty() {
-                        commands.push(BackupPackage {
-                            index: i,
-                            commands: p_commands,
-                        });
-                    }
-                }
-            }
-            if !commands.is_empty() {
+    let mut commands = Vec::new();
+    let selected_user = settings
+        .backup
+        .selected_user
+        .as_ref()
+        .ok_or("No user selected")?;
+
+    for user_backup in phone_backup.users {
+        let user_index = selected_device
+            .user_list
+            .iter()
+            .find(|x| x.id == user_backup.id)
+            .ok_or_else(|| format!("User {} doesn't exist", user_backup.id))?
+            .index;
+
+        for (i, backup_package) in user_backup.packages.iter().enumerate() {
+            let package = packages[user_index]
+                .iter()
+                .find(|x| x.name == backup_package.name)
+                .map(|p| p.into())
+                .ok_or_else(|| format!("Package {} not found for user {}", backup_package.name, user_backup.id))?;
+
+            let p_commands = apply_pkg_state_commands(
+                &package,
+                backup_package.state,
+                selected_user,
+                selected_device,
+            );
+
+            if !p_commands.is_empty() {
                 commands.push(BackupPackage {
-                    index: 0,
-                    commands: vec![],
+                    index: i,
+                    commands: p_commands,
                 });
             }
-            Ok(commands)
         }
-        Err(e) => Err(e.to_string()),
     }
+
+    if !commands.is_empty() {
+        commands.push(BackupPackage {
+            index: 0,
+            commands: Vec::new(),
+        });
+    }
+
+    Ok(commands)
 }
